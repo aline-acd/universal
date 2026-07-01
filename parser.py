@@ -1,14 +1,12 @@
 import re
 from collections import defaultdict
+from typing import Optional
 
 import fitz
 import pandas as pd
 
 
-PADRAO_TOTAL_OBRA = re.compile(
-    r"Total\s+da\s+obra\s+R\$?\s*([0-9.,]+)\s+R\$?\s*([0-9.,]+)",
-    re.IGNORECASE
-)
+PADRAO_DINHEIRO = re.compile(r"R\$?\s*([0-9.,]+)", re.IGNORECASE)
 
 PADRAO_CLIENTE = re.compile(
     r"(?:Cliente|Favorecido)\s+(.+?)(?:\s+Per[ií]odo\s+de\s+Royalty:|\n|$)",
@@ -28,7 +26,7 @@ def limpar_texto(texto: str) -> str:
     return texto.strip()
 
 
-def valor_br_para_float(valor: str) -> float:
+def valor_para_float(valor: str) -> float:
     if valor is None:
         return 0.0
 
@@ -38,17 +36,14 @@ def valor_br_para_float(valor: str) -> float:
     if not valor:
         return 0.0
 
-    # Universal costuma vir no padrão americano: 1,093.26 ou 13.93
-    # Mas também aceitamos padrão brasileiro: 1.093,26
+    # Universal costuma vir no padrão americano: 1,093.26 ou 13.93.
+    # Também aceitamos padrão brasileiro: 1.093,26.
     if "," in valor and "." in valor:
         if valor.rfind(".") > valor.rfind(","):
-            # americano: 1,093.26
             valor = valor.replace(",", "")
         else:
-            # brasileiro: 1.093,26
             valor = valor.replace(".", "").replace(",", ".")
     elif "," in valor and "." not in valor:
-        # brasileiro simples: 13,93
         valor = valor.replace(",", ".")
 
     try:
@@ -93,13 +88,17 @@ def linha_inutil_para_obra(linha: str) -> bool:
         "EXPLORACAO",
         "FONTE DE RENDA",
         "TIPO DE",
+        "RENDA",
         "NÚMERO DE",
         "NUMERO DE",
         "CATÁLOGO",
         "CATALOGO",
         "RECEBIMENTOS",
+        "DO PERÍODO",
+        "DO PERIODO",
         "UNIDADES",
         "VALORES",
+        "RECEBIDOS",
         "SUA COTA",
         "VALOR DEVIDO",
         "RELATÓRIO DE ROYALTY",
@@ -112,6 +111,11 @@ def linha_inutil_para_obra(linha: str) -> bool:
         "FAVORECIDO",
         "PERÍODO DE ROYALTY",
         "PERIODO DE ROYALTY",
+        "AV. DAS AMERICAS",
+        "RJ, BRASIL",
+        "CUSTSERVPUBBR",
+        "VEJA OU FAÇA",
+        "OU PORQUE",
     ]
 
     if any(t in up for t in termos):
@@ -123,27 +127,26 @@ def linha_inutil_para_obra(linha: str) -> bool:
     return False
 
 
-def parece_obra(linha: str) -> bool:
+def parece_titulo_obra(linha: str) -> bool:
     linha = limpar_texto(linha)
     up = linha.upper()
 
     if not linha or linha_inutil_para_obra(linha):
         return False
 
-    # Obra costuma vir em caixa alta e sem valores.
-    if re.search(r"R\$|[0-9]+[.,][0-9]{2}", linha):
-        return False
-
-    # Evita compositor/autor.
     if "..." in linha:
         return False
 
-    # Evita fontes/territórios mais comuns.
+    if re.search(r"R\$|[0-9]+[.,][0-9]{2}", linha):
+        return False
+
     bloqueios = [
         "BRAZIL",
         "PORTUGAL",
         "SPAIN",
         "FRANCE",
+        "BELGIUM",
+        "LUXEMBOURG",
         "USA AND",
         "DOMINIONS",
         "TERRITORIES",
@@ -164,6 +167,20 @@ def parece_obra(linha: str) -> bool:
         "PERF",
         "RADIO",
         "LIVE",
+        "COMPOSITORES",
+        "MUSIC",
+        "PREMIUM",
+        "FAMILY",
+        "INDIV",
+        "TRIAL",
+        "MATCH",
+        "STUDENT",
+        "TIKTOK",
+        "AMAZON",
+        "GLOBOPLAY",
+        "ITUNES",
+        "RHAPSODY",
+        "MUMO",
     ]
 
     if any(b in up for b in bloqueios):
@@ -173,12 +190,30 @@ def parece_obra(linha: str) -> bool:
     if len(letras) < 3:
         return False
 
-    # Aceita títulos com números, tipo "15 MINUTOS", desde que a maior parte seja caixa alta.
-    return up == linha.upper()
+    # O título da obra vem em caixa alta.
+    return linha == up
+
+
+def eh_linha_obra(linhas: list[str], indice: int) -> bool:
+    """
+    A regra mais estável neste layout:
+    a obra aparece em caixa alta e, logo abaixo, vem a linha de compositor com "...".
+    Isso evita confundir fonte, território, autores e valores com obra.
+    """
+    if not parece_titulo_obra(linhas[indice]):
+        return False
+
+    for j in range(indice + 1, min(indice + 4, len(linhas))):
+        if "..." in linhas[j]:
+            return True
+        if linhas[j].upper().startswith("TOTAL DA OBRA"):
+            return False
+
+    return False
 
 
 def extrair_linhas_pagina(pagina) -> list[str]:
-    # sort=False mantém a ordem original da página, que é importante nesse layout.
+    # sort=False é essencial para preservar a ordem real desse PDF.
     texto = pagina.get_text("text", sort=False) or ""
 
     linhas = []
@@ -190,12 +225,33 @@ def extrair_linhas_pagina(pagina) -> list[str]:
     return linhas
 
 
+def extrair_totais_apos_total_da_obra(linhas: list[str], indice: int):
+    """
+    No PDF da Universal o total costuma aparecer assim:
+    Total da obra
+    R$13.93
+    R$7.11
+
+    Em alguns PDFs pode vir tudo na mesma linha. Por isso olhamos a linha atual
+    e as próximas 4 linhas.
+    """
+    valores = []
+
+    for j in range(indice, min(indice + 5, len(linhas))):
+        valores.extend(PADRAO_DINHEIRO.findall(linhas[j]))
+
+    if len(valores) >= 2:
+        return valor_para_float(valores[0]), valor_para_float(valores[1])
+
+    return None, None
+
+
 def processar_pdf_universal(
     caminho_pdf: str,
     nome_arquivo: str,
     pagina_inicio: int = 1,
-    pagina_fim: int | None = None,
-    max_paginas: int | None = None,
+    pagina_fim: Optional[int] = None,
+    max_paginas: Optional[int] = None,
     agrupar: bool = True,
 ) -> pd.DataFrame:
     registros = []
@@ -216,10 +272,9 @@ def processar_pdf_universal(
     doc = fitz.open(caminho_pdf)
 
     try:
-        total_paginas = len(doc)
         paginas_processadas = 0
 
-        for indice in range(total_paginas):
+        for indice in range(len(doc)):
             numero_pagina = indice + 1
 
             if numero_pagina < pagina_inicio:
@@ -241,12 +296,16 @@ def processar_pdf_universal(
             if periodo:
                 periodo_atual = periodo
 
-            for linha in linhas:
-                total_match = PADRAO_TOTAL_OBRA.search(linha)
+            for i, linha in enumerate(linhas):
+                if eh_linha_obra(linhas, i):
+                    obra_atual = linha.strip()
+                    continue
 
-                if total_match and obra_atual:
-                    recebimentos = valor_br_para_float(total_match.group(1))
-                    valor_devido = valor_br_para_float(total_match.group(2))
+                if linha.upper().startswith("TOTAL DA OBRA") and obra_atual:
+                    recebimentos, valor_devido = extrair_totais_apos_total_da_obra(linhas, i)
+
+                    if recebimentos is None or valor_devido is None:
+                        continue
 
                     if agrupar:
                         chave = (nome_arquivo, obra_atual)
@@ -267,11 +326,6 @@ def processar_pdf_universal(
                             "Valor_Devido": valor_devido,
                             "Paginas": str(numero_pagina),
                         })
-
-                    continue
-
-                if parece_obra(linha):
-                    obra_atual = linha.strip()
 
             paginas_processadas += 1
 
